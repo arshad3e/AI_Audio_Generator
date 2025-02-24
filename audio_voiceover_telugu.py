@@ -6,7 +6,7 @@ from pydub.generators import Sine
 from pydub.playback import play
 
 # Path to your service account key JSON file
-os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'glossy-waters-451821-b1-80b1c8ed26a1.json'  # Replace with your actual path
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'put your json key file here'  # Replace with your actual path
 
 
 def generate_telugu_voiceover(telugu_text, output_filename="telugu_meditation_voiceover.mp3"):
