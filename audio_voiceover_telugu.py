@@ -192,7 +192,7 @@ def split_long_sentence(sentence, max_chunk_size):
           sub_sentences.append(current_sub_sentence)
 
      return sub_sentences
-
+#add your own lyrics here
 if __name__ == "__main__":
     telugu_meditation_script = """
 స్వాగతం. ఇది మీ సమయం... విశ్రాంతిగా ఉండటానికి, నెమ్మదిగా తీసుకోవడానికి, మరియు కేవలం ఉండటానికి.
