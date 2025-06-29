@@ -5,10 +5,11 @@ import tempfile
 import re
 import subprocess
 import requests
+import math
+import random
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from PIL import Image, ImageDraw, ImageFont
-# --- FIX 1: ADDED MISSING IMPORTS ---
 from urllib.parse import urljoin
 from gtts import gTTS
 
@@ -35,7 +36,6 @@ FONT_PATH = None # This will be set automatically
 
 # --- RSS Sources ---
 RSS_SOURCES = [
-    # --- FIX 2: UPDATED REUTERS URL ---
     {"name": "Reuters", "url": "http://feeds.reuters.com/reuters/topNews"},
     {"name": "BBC", "url": "http://feeds.bbci.co.uk/news/rss.xml"},
     {"name": "CNN", "url": "http://rss.cnn.com/rss/cnn_topstories.rss"}
@@ -71,25 +71,50 @@ def clean_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
 def scrape_news():
-    news_items = []
+    """
+    Scrapes a few headlines from EACH source to ensure variety, then shuffles
+    and selects the final list.
+    """
+    all_headlines = []
+    num_sources = len(RSS_SOURCES)
+    # Calculate how many headlines to get from each source.
+    # e.g., 5 total headlines / 3 sources = 1.66 -> math.ceil = 2 per source
+    limit_per_source = math.ceil(HEADLINES_LIMIT / num_sources)
+    logger.info(f"Aiming for up to {limit_per_source} headlines from each of {num_sources} sources.")
+
     headers = {"User-Agent": USER_AGENT}
     for source in RSS_SOURCES:
-        if len(news_items) >= HEADLINES_LIMIT: break
         try:
             logger.info(f"Scraping headlines from {source['name']}")
             response = requests.get(source['url'], headers=headers, timeout=15)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'xml')
-            for item in soup.find_all('item', limit=HEADLINES_LIMIT):
+            
+            # Use the calculated limit_per_source
+            items_found = 0
+            for item in soup.find_all('item'):
+                if items_found >= limit_per_source:
+                    break
                 title = item.find('title')
                 link = item.find('link')
                 if title and link and title.text and link.text:
-                    news_items.append({"title": clean_text(title.text), "link": link.text.strip()})
-                    if len(news_items) >= HEADLINES_LIMIT: break
+                    all_headlines.append({"title": clean_text(title.text), "link": link.text.strip()})
+                    items_found += 1
+            logger.info(f"Got {items_found} headlines from {source['name']}.")
         except Exception as e:
             logger.error(f"Failed to scrape {source['name']}: {e}")
-    logger.info(f"Total scraped {len(news_items)} news items")
-    return news_items
+
+    if not all_headlines:
+        logger.error("Could not scrape any headlines from any source.")
+        return []
+
+    # Shuffle the collected headlines for variety
+    random.shuffle(all_headlines)
+    
+    # Select the final number of headlines
+    final_items = all_headlines[:HEADLINES_LIMIT]
+    logger.info(f"Selected a final, mixed list of {len(final_items)} headlines.")
+    return final_items
 
 def crop_to_fill(image, target_width, target_height):
     target_ratio = target_width / target_height
@@ -142,7 +167,7 @@ def create_clip_asset(url, headline, output_path):
                     if src and (src.startswith('http') or src.startswith('//')):
                         box = element.bounding_box()
                         if box and box.get('width', 0) > 400:
-                            image_url = urljoin(page.url, src) # urljoin is now defined
+                            image_url = urljoin(page.url, src)
                             logger.info(f"Found suitable image: {image_url}")
                             break
                 if image_url: break
@@ -175,7 +200,7 @@ def create_clip_asset(url, headline, output_path):
 
 def generate_audio(text, output_path):
     try:
-        tts = gTTS(text=text, lang='en', slow=False) # gTTS is now defined
+        tts = gTTS(text=text, lang='en', slow=False)
         tts.save(output_path)
         logger.info(f"Audio generated for: {text}")
         return True
