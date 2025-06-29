@@ -6,44 +6,61 @@ import re
 import subprocess
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-from PIL import Image
-from gtts import gTTS
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from PIL import Image, ImageDraw, ImageFont
+# --- FIX 1: ADDED MISSING IMPORTS ---
 from urllib.parse import urljoin
+from gtts import gTTS
+
+# --- New Requirement: This script now requires the matplotlib library ---
+# --- Please run: pip3 install matplotlib (if you haven't already) ---
+try:
+    from matplotlib import font_manager
+except ImportError:
+    print("FATAL ERROR: The 'matplotlib' library is not installed.")
+    print("Please run 'pip3 install matplotlib' in your terminal to continue.")
+    exit()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Constants
-OUTPUT_DIR = "news_output"
-VIDEO_WIDTH, VIDEO_HEIGHT = 1080, 1920  # 9:16 aspect ratio
-HEADLINES_LIMIT = 5  # Number of headlines to process
-CLIP_DURATION = 5  # Target seconds per clip
-MIN_CLIP_DURATION = 3  # Minimum seconds per clip
-USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
-]
+# --- Constants ---
+VIDEO_WIDTH, VIDEO_HEIGHT = 1080, 1920
+HEADLINES_LIMIT = 5
+CLIP_DURATION = 5
+MIN_CLIP_DURATION = 3
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+FONT_PATH = None # This will be set automatically
+
+# --- RSS Sources ---
 RSS_SOURCES = [
-    {"name": "Reuters", "url": "https://www.reuters.com/arc/outboundfeeds/news-rss/"},
+    # --- FIX 2: UPDATED REUTERS URL ---
+    {"name": "Reuters", "url": "http://feeds.reuters.com/reuters/topNews"},
     {"name": "BBC", "url": "http://feeds.bbci.co.uk/news/rss.xml"},
     {"name": "CNN", "url": "http://rss.cnn.com/rss/cnn_topstories.rss"}
 ]
 
+# --- Helper Functions ---
+
+def setup_font():
+    """Finds a suitable font on the system automatically."""
+    global FONT_PATH
+    font_preferences = ["Arial", "Helvetica Neue", "Calibri", "Helvetica", "DejaVu Sans", "Liberation Sans"]
+    for font_name in font_preferences:
+        try:
+            FONT_PATH = font_manager.findfont(font_name, fallback_to_default=False)
+            logger.info(f"Successfully found system font: '{font_name}' at {FONT_PATH}")
+            return True
+        except Exception:
+            logger.debug(f"Font '{font_name}' not found, trying next.")
+    
+    logger.error("FATAL: Could not find any suitable system fonts from the preferred list.")
+    return False
+
 def setup_output_directory():
-    """Create a temporary directory for intermediate files."""
     try:
-        temp_dir = tempfile.mkdtemp(prefix="news_scraper_")
-        test_file = os.path.join(temp_dir, "test.txt")
-        with open(test_file, 'w') as f:
-            f.write("test")
-        os.remove(test_file)
-        stat = shutil.disk_usage(temp_dir)
-        if stat.free < 1 * 1024 * 1024 * 1024:  # Less than 1GB
-            logger.error(f"Insufficient disk space in {temp_dir}: {stat.free / (1024**3):.2f} GB free")
-            raise RuntimeError("Insufficient disk space")
+        temp_dir = tempfile.mkdtemp(prefix="news_video_")
         logger.info(f"Created temporary directory: {temp_dir}")
         return temp_dir
     except Exception as e:
@@ -51,307 +68,205 @@ def setup_output_directory():
         raise
 
 def clean_text(text):
-    """Clean text by removing extra whitespace and special characters."""
-    text = re.sub(r'\s+', ' ', text).strip()
-    text = re.sub(r'[^\w\s.,-]', '', text)
-    return text[:100]  # Limit length for brevity
+    return re.sub(r'\s+', ' ', text).strip()
 
 def scrape_news():
-    """Scrape latest news headlines and URLs from RSS feeds."""
     news_items = []
+    headers = {"User-Agent": USER_AGENT}
     for source in RSS_SOURCES:
-        if len(news_items) >= HEADLINES_LIMIT:
-            break
-        name, url = source["name"], source["url"]
-        logger.info(f"Scraping headlines from {name} ({url})")
-        
-        for user_agent in USER_AGENTS:
-            for attempt in range(3):
-                try:
-                    headers = {"User-Agent": user_agent}
-                    response = requests.get(url, headers=headers, timeout=10)
-                    response.raise_for_status()
-                    soup = BeautifulSoup(response.text, 'xml')
-                    items = soup.find_all('item', limit=HEADLINES_LIMIT + 5 - len(news_items))
-                    for item in items:
-                        title = item.find('title')
-                        link = item.find('link')
-                        if title and link and title.text and link.text:
-                            title_text = clean_text(title.text)
-                            if title_text and len(news_items) < HEADLINES_LIMIT:
-                                news_items.append({"title": title_text, "link": link.text})
-                        if len(news_items) >= HEADLINES_LIMIT:
-                            break
-                    logger.info(f"Scraped {len(news_items)} news items from {name}")
-                    break  # Success, move to next source
-                except requests.exceptions.HTTPError as e:
-                    logger.warning(f"Attempt {attempt + 1} with UA {user_agent} failed for {name}: {e}")
-                    if response.status_code == 401:
-                        logger.error(f"401 Forbidden for {url}: {response.text[:200]}")
-                    if attempt == 2:
-                        logger.error(f"Failed to scrape {name} after 3 attempts with UA {user_agent}")
-                    continue
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1} with UA {user_agent} failed for {name}: {e}")
-                    if attempt == 2:
-                        logger.error(f"Failed to scrape {name} after 3 attempts with UA {user_agent}")
-                    continue
-            if len(news_items) >= HEADLINES_LIMIT:
-                break
-    
+        if len(news_items) >= HEADLINES_LIMIT: break
+        try:
+            logger.info(f"Scraping headlines from {source['name']}")
+            response = requests.get(source['url'], headers=headers, timeout=15)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'xml')
+            for item in soup.find_all('item', limit=HEADLINES_LIMIT):
+                title = item.find('title')
+                link = item.find('link')
+                if title and link and title.text and link.text:
+                    news_items.append({"title": clean_text(title.text), "link": link.text.strip()})
+                    if len(news_items) >= HEADLINES_LIMIT: break
+        except Exception as e:
+            logger.error(f"Failed to scrape {source['name']}: {e}")
     logger.info(f"Total scraped {len(news_items)} news items")
     return news_items
 
-def capture_screenshot(url, output_path):
-    """Capture a screenshot of a webpage and crop to 9:16 using Playwright."""
+def crop_to_fill(image, target_width, target_height):
+    target_ratio = target_width / target_height
+    image_ratio = image.width / image.height
+    
+    if image_ratio > target_ratio:
+        new_width = int(target_ratio * image.height)
+        left, right = (image.width - new_width) // 2, (image.width + new_width) // 2
+        top, bottom = 0, image.height
+    else:
+        new_height = int(image.width / target_ratio)
+        top, bottom = (image.height - new_height) // 2, (image.height + new_height) // 2
+        left, right = 0, image.width
+        
+    return image.crop((left, top, right, bottom)).resize((target_width, target_height), Image.LANCZOS)
+
+def draw_multiline_text(draw, text, font, max_width, start_y, text_color):
+    words = text.split()
+    lines = []
+    current_line = ""
+    for word in words:
+        if draw.textbbox((0, 0), current_line + " " + word, font=font)[2] <= max_width:
+            current_line += " " + word
+        else:
+            lines.append(current_line.strip())
+            current_line = word
+    lines.append(current_line.strip())
+
+    y = start_y
+    for line in lines:
+        draw.text((VIDEO_WIDTH / 2, y), line, font=font, fill=text_color, anchor="ms")
+        y += font.getbbox("A")[3] * 1.2
+    return y
+
+def create_clip_asset(url, headline, output_path):
+    logger.info(f"Creating visual asset for: {headline}")
+    image_url = None
+    
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
-            page = browser.new_page()
-            page.set_viewport_size({"width": VIDEO_WIDTH * 2, "height": VIDEO_HEIGHT * 2})
-            page.set_extra_http_headers({"User-Agent": USER_AGENTS[0]})
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=USER_AGENT)
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            temp_path = output_path + "_temp.png"
-            page.screenshot(path=temp_path)
+            
+            image_selectors = ['article img', 'main img', '.story-body img', 'img[itemprop="image"]']
+            for selector in image_selectors:
+                elements = page.locator(selector).all()
+                for element in elements:
+                    src = element.get_attribute('src')
+                    if src and (src.startswith('http') or src.startswith('//')):
+                        box = element.bounding_box()
+                        if box and box.get('width', 0) > 400:
+                            image_url = urljoin(page.url, src) # urljoin is now defined
+                            logger.info(f"Found suitable image: {image_url}")
+                            break
+                if image_url: break
             browser.close()
-        
-        img = Image.open(temp_path)
-        width, height = img.size
-        target_ratio = VIDEO_WIDTH / VIDEO_HEIGHT
-        current_ratio = width / height
-        if current_ratio > target_ratio:
-            new_width = int(height * target_ratio)
-            left = (width - new_width) // 2
-            img = img.crop((left, 0, left + new_width, height))
-        else:
-            new_height = int(width / target_ratio)
-            top = (height - new_height) // 2
-            img = img.crop((0, top, width, top + new_height))
-        img = img.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.LANCZOS)
-        img.save(output_path)
-        os.remove(temp_path)
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise RuntimeError("Generated screenshot is empty or missing")
-        logger.info(f"Screenshot saved: {output_path}")
-        return True
     except Exception as e:
-        logger.error(f"Error capturing screenshot for {url}: {e}")
-        return False
+        logger.warning(f"Playwright failed to get image from {url}: {e}. Proceeding without image.")
+
+    TEXT_AREA_HEIGHT = 800
+    IMAGE_AREA_HEIGHT = VIDEO_HEIGHT - TEXT_AREA_HEIGHT
+    
+    canvas = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), color='#222222')
+    draw = ImageDraw.Draw(canvas)
+
+    font_headline = ImageFont.truetype(FONT_PATH, 90)
+    draw_multiline_text(draw, headline, font_headline, 980, 250, '#FFFFFF')
+
+    if image_url:
+        try:
+            image_response = requests.get(image_url, timeout=15, headers={'User-Agent': USER_AGENT})
+            image_response.raise_for_status()
+            article_image = Image.open(requests.get(image_url, stream=True).raw).convert("RGB")
+            cropped_image = crop_to_fill(article_image, VIDEO_WIDTH, IMAGE_AREA_HEIGHT)
+            canvas.paste(cropped_image, (0, TEXT_AREA_HEIGHT))
+            logger.info("Successfully added image to visual.")
+        except Exception as e:
+            logger.error(f"Failed to download or process image {image_url}: {e}. Using text-only visual.")
+
+    canvas.save(output_path)
+    return True
 
 def generate_audio(text, output_path):
-    """Generate audio from text using gTTS."""
     try:
-        tts = gTTS(text=text, lang='en', slow=False)
+        tts = gTTS(text=text, lang='en', slow=False) # gTTS is now defined
         tts.save(output_path)
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise RuntimeError("Generated audio file is empty or missing")
-        logger.info(f"Audio generated: {output_path}")
+        logger.info(f"Audio generated for: {text}")
         return True
     except Exception as e:
         logger.error(f"Error generating audio: {e}")
         return False
 
 def check_ffmpeg():
-    """Check if ffmpeg is installed and supports required codecs."""
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
-        logger.error("ffmpeg not found in PATH")
-        return None, False
-    try:
-        result = subprocess.run([ffmpeg_path, '-version'], capture_output=True, text=True, check=True)
-        logger.info(f"ffmpeg version: {result.stdout.splitlines()[0]}")
-        
-        result = subprocess.run([ffmpeg_path, '-codecs'], capture_output=True, text=True, check=True)
-        codecs = result.stdout
-        has_libx264 = 'libx264' in codecs
-        has_aac = 'aac' in codecs
-        logger.info(f"ffmpeg codecs: libx264={has_libx264}, aac={has_aac}")
-        return ffmpeg_path, has_libx264 and has_aac
-    except subprocess.CalledProcessError as e:
-        logger.error(f"ffmpeg error: {e.stderr}")
-        return None, False
-    except Exception as e:
-        logger.error(f"Error checking ffmpeg: {e}")
-        return None, False
+        logger.error("ffmpeg not found in PATH. Please install and add to system PATH.")
+    return ffmpeg_path
 
-def create_video_clips(news_items, output_dir):
-    """Create video clips from screenshots and audio, returning clip metadata."""
-    clips = []
-    for i, item in enumerate(news_items[:HEADLINES_LIMIT]):  # Explicit limit to prevent loops
-        screenshot_path = os.path.join(output_dir, f"screenshot_{i}.png")
-        audio_path = os.path.join(output_dir, f"audio_{i}.mp3")
-        extended_audio_path = os.path.join(output_dir, f"extended_audio_{i}.mp3")
+def create_video_clips(news_items, temp_dir):
+    clips_data = []
+    for i, item in enumerate(news_items):
+        logger.info(f"--- Processing clip {i+1}/{len(news_items)}: {item['title']} ---")
+        visual_path = os.path.join(temp_dir, f"visual_{i}.png")
+        audio_path = os.path.join(temp_dir, f"audio_{i}.mp3")
+
+        if not create_clip_asset(item['link'], item['title'], visual_path): continue
+        if not generate_audio(item['title'], audio_path): continue
         
-        # Capture screenshot
-        if not capture_screenshot(item['link'], screenshot_path):
-            continue
-        
-        # Generate audio
-        if not generate_audio(item['title'], audio_path):
-            continue
-        
-        # Extend audio with silence if too short
         try:
-            audio_duration = float(subprocess.run(
-                ['ffprobe', '-i', audio_path, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'csv=p=0'],
-                capture_output=True, text=True, check=True
-            ).stdout.strip())
-            logger.info(f"Audio {i} duration: {audio_duration:.2f} seconds")
-            
-            if audio_duration < CLIP_DURATION:
-                silence_duration = CLIP_DURATION - audio_duration
-                silence_path = os.path.join(output_dir, f"silence_{i}.mp3")
-                subprocess.run(
-                    ['ffmpeg', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', str(silence_duration), '-y', silence_path],
-                    capture_output=True, text=True, check=True
-                )
-                subprocess.run(
-                    ['ffmpeg', '-i', audio_path, '-i', silence_path, '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1', '-y', extended_audio_path],
-                    capture_output=True, text=True, check=True
-                )
-                os.remove(audio_path)
-                os.remove(silence_path)
-                os.rename(extended_audio_path, audio_path)
-                audio_duration = float(subprocess.run(
-                    ['ffprobe', '-i', audio_path, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'csv=p=0'],
-                    capture_output=True, text=True, check=True
-                ).stdout.strip())
-                logger.info(f"Extended audio {i} to {audio_duration:.2f} seconds")
-            
-            clip_duration = max(audio_duration, MIN_CLIP_DURATION)
-            if clip_duration > CLIP_DURATION:
-                clip_duration = CLIP_DURATION
-            
-            clips.append({
-                "screenshot_path": screenshot_path,
-                "audio_path": audio_path,
-                "duration": clip_duration
-            })
-            logger.info(f"Prepared clip for headline {i+1} with duration {clip_duration:.2f} seconds")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error processing audio for headline {i+1}: {e.stderr}")
-            continue
+            ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
+            result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
+            audio_duration = float(result.stdout.strip())
+            final_duration = min(CLIP_DURATION, max(MIN_CLIP_DURATION, audio_duration + 0.5))
+            clips_data.append({"visual_path": visual_path, "audio_path": audio_path, "duration": final_duration})
+            logger.info(f"Prepared clip for '{item['title']}' with duration {final_duration:.2f}s")
         except Exception as e:
-            logger.error(f"Error preparing clip for headline {i+1}: {e}")
-            continue
-    
-    return clips
+            logger.error(f"Failed to process audio for '{item['title']}': {e}")
+            
+    return clips_data
 
-def compile_video(clips, output_path):
-    """Compile video clips into a final video using ffmpeg via subprocess."""
-    try:
-        ffmpeg_path, supports_codecs = check_ffmpeg()
-        if not ffmpeg_path:
-            raise RuntimeError("ffmpeg is not properly configured")
+def compile_final_video(clips_data, output_path, ffmpeg_path):
+    if not clips_data:
+        logger.error("No clips were generated to compile.")
+        return False
         
-        if not clips:
-            raise ValueError("No valid clips to compile")
-        
-        temp_dir = os.path.dirname(output_path)
-        clip_files = []
-        
-        # Generate individual clip files
-        for i, clip in enumerate(clips):
-            clip_path = os.path.join(temp_dir, f"clip_{i}.mp4")
-            try:
-                vcodec = "libx264" if supports_codecs else "mpeg4"
-                acodec = "aac" if supports_codecs else "mp3"
-                cmd = [
-                    ffmpeg_path,
-                    '-loop', '1',
-                    '-i', clip['screenshot_path'],
-                    '-i', clip['audio_path'],
-                    '-c:v', vcodec,
-                    '-c:a', acodec,
-                    '-pix_fmt', 'yuv420p',
-                    '-r', '24',
-                    '-b:v', '1000k',
-                    '-t', str(clip['duration']),
-                    '-y', clip_path
-                ]
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                if result.stderr:
-                    logger.warning(f"ffmpeg warning for clip {i+1}: {result.stderr}")
-                clip_files.append(clip_path)
-                logger.info(f"Generated clip {i+1} at {clip_path}")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"ffmpeg error generating clip {i+1}: {e.stderr}")
-                continue
-            except Exception as e:
-                logger.error(f"Error generating clip {i+1}: {str(e)}")
-                continue
-        
-        if not clip_files:
-            raise ValueError("No clips generated successfully")
-        
-        # Concatenate clips using ffmpeg
-        concat_list = os.path.join(temp_dir, "concat_list.txt")
-        with open(concat_list, 'w') as f:
-            for clip_path in clip_files:
-                f.write(f"file '{clip_path}'\n")
-        
+    temp_dir = os.path.dirname(clips_data[0]["visual_path"])
+    concat_list_path = os.path.join(temp_dir, "concat_list.txt")
+    
+    clip_files = []
+    for i, clip in enumerate(clips_data):
+        clip_path = os.path.join(temp_dir, f"clip_{i}.mp4")
         cmd = [
-            ffmpeg_path,
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', concat_list,
-            '-c:v', 'copy',
-            '-c:a', 'copy',
-            '-y', output_path
+            ffmpeg_path, '-loop', '1', '-i', clip['visual_path'], '-i', clip['audio_path'],
+            '-c:v', 'libx264', '-tune', 'stillimage', '-c:a', 'aac', '-b:a', '192k',
+            '-pix_fmt', 'yuv420p', '-r', '24', '-shortest', '-t', str(clip['duration']), '-y', clip_path
         ]
-        
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            logger.info(f"ffmpeg concat output: {result.stdout}")
-            logger.info(f"Final video saved: {output_path}")
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            clip_files.append(clip_path)
         except subprocess.CalledProcessError as e:
-            logger.error(f"ffmpeg concat error: {e.stderr}")
-            raise
-        
-        # Clean up individual clip files
-        for clip_path in clip_files:
-            os.remove(clip_path)
-        os.remove(concat_list)
-        
+            logger.error(f"Error creating video segment {i}: {e.stderr}")
+            return False
+
+    with open(concat_list_path, 'w') as f:
+        for clip_file in clip_files:
+            f.write(f"file '{os.path.abspath(clip_file)}'\n")
+
+    final_cmd = [ffmpeg_path, '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', '-y', output_path]
+    try:
+        subprocess.run(final_cmd, check=True, capture_output=True, text=True)
+        logger.info(f"Final video successfully compiled at: {output_path}")
         return True
-    except Exception as e:
-        logger.error(f"Error compiling video: {str(e)}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FATAL: Error compiling final video: {e.stderr}")
         return False
 
 def main():
-    """Main function to orchestrate the news video creation."""
-    output_dir = setup_output_directory()
-    output_video = os.path.join(os.getcwd(), "news_summary.mp4")
-    
+    if not setup_font(): return
+    ffmpeg_path = check_ffmpeg()
+    if not ffmpeg_path: return
+
+    temp_dir = None
     try:
+        temp_dir = setup_output_directory()
+        output_video_path = os.path.join(os.getcwd(), "news_summary.mp4")
         news_items = scrape_news()
-        if not news_items:
-            logger.error("No news items found. Exiting.")
-            return
-        
-        clips = create_video_clips(news_items, output_dir)
-        
-        if clips:
-            compile_video(clips, output_video)
+        if not news_items: return
+        clips_data = create_video_clips(news_items, temp_dir)
+        if clips_data:
+            compile_final_video(clips_data, output_video_path, ffmpeg_path)
         else:
-            logger.error("No valid clips generated.")
-    
+            logger.error("No valid clips created. Final video not generated.")
     finally:
-        try:
-            shutil.rmtree(output_dir)
-            logger.info(f"Cleaned up temporary directory: {output_dir}")
-        except Exception as e:
-            logger.error(f"Error cleaning up: {e}")
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up temporary directory: {temp_dir}")
 
 if __name__ == "__main__":
     main()
