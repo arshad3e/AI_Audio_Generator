@@ -35,6 +35,27 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 FONT_PATH = None
 VOICE = "en-US-AriaNeural"
 HISTORY_FILE = "processed_urls.txt"
+FPS = 24 # Frames per second for the video
+
+# --- Ken Burns Effect Variations ---
+# Each string is a different pan/zoom effect for ffmpeg's zoompan filter.
+# 'iw' and 'ih' are input width and height. 'on' is the output frame number.
+KEN_BURNS_EFFECTS = [
+    # Zoom in, centered
+    "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+    # Zoom in, pan right
+    "x='(iw-iw/zoom)':y='(ih-ih/zoom)/2'",
+    # Zoom in, pan left
+    "x=0:y='(ih-ih/zoom)/2'",
+    # Zoom in, pan down
+    "x='(iw-iw/zoom)/2':y='(ih-ih/zoom)'",
+    # Zoom in, pan up
+    "x='(iw-iw/zoom)/2':y=0",
+    # Zoom in, pan to top-left
+    "x=0:y=0",
+    # Zoom in, pan to bottom-right
+    "x='iw-iw/zoom':y='ih-ih/zoom'"
+]
 
 # --- RSS Sources ---
 RSS_SOURCES = [
@@ -130,40 +151,28 @@ def draw_multiline_text(draw, text, font, max_width, start_y, text_color):
     return y
 
 def create_clip_asset(url, headline, output_path):
-    """
-    Overhauled function to reliably find and use an image from the article.
-    """
     logger.info(f"Creating visual asset for: {headline}")
     image_url = None
-    
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(user_agent=USER_AGENT)
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            
-            # --- STEP 1: Trigger Lazy Loading ---
-            page.wait_for_timeout(1500) # Wait for initial scripts
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)") # Scroll to trigger loads
-            page.wait_for_timeout(1500) # Wait for images to load
-
-            # --- STEP 2: Targeted Search for the Best Article Image ---
+            page.wait_for_timeout(1500)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
+            page.wait_for_timeout(1500)
             image_selectors = ['article img', 'main img', '.story-body img', 'img[itemprop="image"]']
             for selector in image_selectors:
                 elements = page.locator(selector).all()
                 for element in elements:
-                    # Check multiple attributes for the image URL
                     src = (element.get_attribute('srcset') or 
                            element.get_attribute('data-src') or 
                            element.get_attribute('src'))
                     if src:
-                        # Clean up the URL (e.g., from srcset)
                         image_url = urljoin(page.url, src.split(',')[0].split(' ')[0])
                         logger.info(f"Found hero image via targeted search: {image_url}")
                         break
                 if image_url: break
-
-            # --- STEP 3: Fallback - Find the Largest Image on the Page ---
             if not image_url:
                 logger.warning("Targeted search failed. Falling back to find largest image on page.")
                 all_images = page.locator('img').all()
@@ -172,24 +181,21 @@ def create_clip_asset(url, headline, output_path):
                 for img in all_images:
                     try:
                         box = img.bounding_box()
-                        if box and box['width'] > 200 and box['height'] > 200: # Filter out small icons
+                        if box and box['width'] > 200 and box['height'] > 200:
                             area = box['width'] * box['height']
                             if area > max_area:
                                 max_area = area
                                 src = img.get_attribute('src')
                                 if src:
                                     best_url = urljoin(page.url, src)
-                    except Exception:
-                        continue # Ignore invisible or non-existent elements
+                    except Exception: continue
                 if best_url:
                     image_url = best_url
                     logger.info(f"Found largest image via fallback: {image_url}")
-
             browser.close()
     except Exception as e:
         logger.warning(f"Playwright failed to get image from {url}: {e}. Proceeding without image.")
 
-    # --- Image Drawing Logic (No changes here, but now it's more likely to have an image) ---
     TEXT_AREA_HEIGHT = 800
     IMAGE_AREA_HEIGHT = VIDEO_HEIGHT - TEXT_AREA_HEIGHT
     canvas = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), color='#222222')
@@ -206,7 +212,7 @@ def create_clip_asset(url, headline, output_path):
             canvas.paste(cropped_image, (0, TEXT_AREA_HEIGHT))
             logger.info("Successfully attached image to visual.")
         except Exception as e:
-            logger.error(f"Failed to download or process image {image_url}: {e}. Using text-only visual.")
+            logger.error(f"Failed to process image {image_url}: {e}. Using text-only visual.")
     else:
         logger.error("All attempts to find an image failed. Creating text-only slide.")
 
@@ -255,25 +261,58 @@ def compile_final_video(clips_data, output_path, ffmpeg_path):
     if not clips_data:
         logger.error("No clips were generated to compile.")
         return False
+        
     temp_dir = os.path.dirname(clips_data[0]["visual_path"])
     concat_list_path = os.path.join(temp_dir, "concat_list.txt")
     clip_files = []
+
     for i, clip in enumerate(clips_data):
         clip_path = os.path.join(temp_dir, f"clip_{i}.mp4")
+        
+        # --- THIS IS THE MAJOR CHANGE ---
+        # We now build a complex ffmpeg filter to create the Ken Burns effect.
+        
+        duration_frames = int(clip['duration'] * FPS)
+        chosen_effect = random.choice(KEN_BURNS_EFFECTS)
+        
+        # A slow zoom from 1.0x to 1.1x over the clip's duration
+        zoom_level = "1.1" 
+        
+        # Build the zoompan filter string
+        zoompan_filter = (
+            f"scale={VIDEO_WIDTH}*2:-1,"
+            f"zoompan=z='min(zoom+{1/(duration_frames/ (float(zoom_level)-1))},{zoom_level})':"
+            f"d={duration_frames}:{chosen_effect}:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
+        )
+        
         cmd = [
-            ffmpeg_path, '-loop', '1', '-i', clip['visual_path'], '-i', clip['audio_path'],
-            '-c:v', 'libx264', '-tune', 'stillimage', '-c:a', 'aac', '-b:a', '192k',
-            '-pix_fmt', 'yuv420p', '-r', '24', '-shortest', '-t', str(clip['duration']), '-y', clip_path
+            ffmpeg_path,
+            '-i', clip['visual_path'],
+            '-i', clip['audio_path'],
+            '-filter_complex', f"[0:v]{zoompan_filter}[v]",
+            '-map', '[v]',
+            '-map', '1:a',
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-pix_fmt', 'yuv420p',
+            '-r', str(FPS),
+            '-shortest',
+            '-y', clip_path
         ]
+        
         try:
+            logger.info(f"Applying Ken Burns effect for clip {i+1}...")
             subprocess.run(cmd, check=True, capture_output=True, text=True)
             clip_files.append(clip_path)
         except subprocess.CalledProcessError as e:
             logger.error(f"Error creating video segment {i}: {e.stderr}")
             return False
+            
     with open(concat_list_path, 'w') as f:
         for clip_file in clip_files:
             f.write(f"file '{os.path.abspath(clip_file)}'\n")
+
     final_cmd = [ffmpeg_path, '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', '-y', output_path]
     try:
         subprocess.run(final_cmd, check=True, capture_output=True, text=True)
@@ -282,7 +321,7 @@ def compile_final_video(clips_data, output_path, ffmpeg_path):
     except subprocess.CalledProcessError as e:
         logger.error(f"FATAL: Error compiling final video: {e.stderr}")
         return False
-    
+
 def main():
     if not setup_font(): return
     ffmpeg_path = check_ffmpeg()
