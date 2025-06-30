@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # --- Constants ---
 VIDEO_WIDTH, VIDEO_HEIGHT = 1080, 1920
 HEADLINES_LIMIT = 5
-CLIP_DURATION = 5
+# CLIP_DURATION = 5 # --- REMOVED: This is no longer needed as duration is now dynamic ---
 MIN_CLIP_DURATION = 3
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
 FONT_PATH = None # This will be set automatically
@@ -77,8 +77,6 @@ def scrape_news():
     """
     all_headlines = []
     num_sources = len(RSS_SOURCES)
-    # Calculate how many headlines to get from each source.
-    # e.g., 5 total headlines / 3 sources = 1.66 -> math.ceil = 2 per source
     limit_per_source = math.ceil(HEADLINES_LIMIT / num_sources)
     logger.info(f"Aiming for up to {limit_per_source} headlines from each of {num_sources} sources.")
 
@@ -90,7 +88,6 @@ def scrape_news():
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'xml')
             
-            # Use the calculated limit_per_source
             items_found = 0
             for item in soup.find_all('item'):
                 if items_found >= limit_per_source:
@@ -108,10 +105,8 @@ def scrape_news():
         logger.error("Could not scrape any headlines from any source.")
         return []
 
-    # Shuffle the collected headlines for variety
     random.shuffle(all_headlines)
     
-    # Select the final number of headlines
     final_items = all_headlines[:HEADLINES_LIMIT]
     logger.info(f"Selected a final, mixed list of {len(final_items)} headlines.")
     return final_items
@@ -228,9 +223,14 @@ def create_video_clips(news_items, temp_dir):
             ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
             result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
             audio_duration = float(result.stdout.strip())
-            final_duration = min(CLIP_DURATION, max(MIN_CLIP_DURATION, audio_duration + 0.5))
+            
+            # --- THIS IS THE FIX ---
+            # The duration is now the audio length (+ a buffer), or the minimum duration, whichever is longer.
+            # The fixed 5-second cap has been removed.
+            final_duration = max(MIN_CLIP_DURATION, audio_duration + 0.5)
+
             clips_data.append({"visual_path": visual_path, "audio_path": audio_path, "duration": final_duration})
-            logger.info(f"Prepared clip for '{item['title']}' with duration {final_duration:.2f}s")
+            logger.info(f"Prepared clip for '{item['title']}' with dynamic duration {final_duration:.2f}s")
         except Exception as e:
             logger.error(f"Failed to process audio for '{item['title']}': {e}")
             
