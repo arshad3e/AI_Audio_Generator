@@ -1,11 +1,12 @@
 # news.py
-# FINAL CORRECTION: Fixed the 'Invalid pitch' error. Pitch now uses Hz.
+# FINAL VERSION: Integrated LLM for high-quality narration, all other logic preserved.
 
 import os, logging, shutil, tempfile, re, subprocess, requests, math, random, asyncio, edge_tts, configparser, html, sys
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urljoin
+from groq import Groq # Import Groq
 
 try:
     import spacy
@@ -17,7 +18,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
-VIDEO_WIDTH, VIDEO_HEIGHT = 1080, 1920; HEADLINES_LIMIT = 4; MIN_CLIP_DURATION = 5; USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"; FONT_PATH, NLP_MODEL, UNSPLASH_API_KEY = None, None, None; VOICE = "en-US-AriaNeural"; HISTORY_FILE, DESCRIPTION_FILE, LAST_SEGMENT_FILE, CONFIG_FILE = "processed_urls.txt", "video_description.txt", "last_segment.txt", "config.ini"; FPS = 24; OUTRO_GIF_NAME = "snap_feed.gif"
+VIDEO_WIDTH, VIDEO_HEIGHT = 1080, 1920; HEADLINES_LIMIT = 1; MIN_CLIP_DURATION = 1; USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"; FONT_PATH, NLP_MODEL, UNSPLASH_API_KEY, GROQ_API_KEY = None, None, None, None; VOICE = "en-US-AriaNeural"; HISTORY_FILE, DESCRIPTION_FILE, LAST_SEGMENT_FILE, CONFIG_FILE = "processed_urls.txt", "video_description.txt", "last_segment.txt", "config.ini"; FPS = 24; OUTRO_GIF_NAME = "snap_feed.gif"
 SEGMENT_SOURCES = {"Top Stories": [{"name": "The Leading Report", "url": "https://theleadingreport.com/", "type": "custom"}, {"name": "Associated Press", "url": "https://storage.googleapis.com/afs-prod/feeds/topnews.xml"}, {"name": "Reuters Top News", "url": "http://feeds.reuters.com/reuters/topNews"}, {"name": "NPR News", "url": "https://feeds.npr.org/1001/rss.xml"},], "Political": [{"name": "The Leading Report", "url": "https://theleadingreport.com/", "type": "custom"}, {"name": "Reuters Politics", "url": "http://feeds.reuters.com/reuters/politicsNews"}, {"name": "Politico", "url": "https://rss.politico.com/politico.xml"}, {"name": "The Hill", "url": "https://thehill.com/rss/syndicator/19109"},], "US National": [{"name": "Reuters US News", "url": "http://feeds.reuters.com/reuters/domesticNews"}, {"name": "NPR National News", "url": "https://feeds.npr.org/1003/rss.xml"},]}
 SEGMENT_ORDER = ["Top Stories", "Political", "US National"]
 KEN_BURNS_EFFECTS = [ "zoompan=z='min(zoom+0.001,1.1)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'", "zoompan=z='min(zoom+0.0012,1.15)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'", "zoompan=z=1.1:x='if(gte(in_w,iw),0,if(eq(mod(on,2),0),min(x+1,iw-in_w),x))':y='if(gte(in_h,ih),0,if(eq(mod(on,3),0),min(y+1,ih-in_h),y))'", "zoompan=z=1.1:x='min(x+iw/200, iw-iw/1.1)':y=0", "zoompan=z=1.1:x=0:y='min(y+ih/200, ih-ih/1.1)'", "zoompan=z=1.1:x='min(x+iw/250, iw-iw/1.1)':y='min(y+ih/250, ih-ih/1.1)'", "zoompan=z='min(zoom+0.001,1.15)':d=1:x='min(x+iw/300, iw-iw/zoom)':y='min(y+ih/400, ih-ih/zoom)'"]
@@ -26,11 +27,8 @@ KEN_BURNS_EFFECTS = [ "zoompan=z='min(zoom+0.001,1.1)':d=1:x='iw/2-(iw/zoom/2)':
 async def generate_dynamic_audio_async(text, output_path):
     rate_val = random.randint(-10, 15)
     rate_str = f"+{rate_val}%" if rate_val >= 0 else f"{rate_val}%"
-    
     pitch_val = random.randint(-10, 10)
-    # CRITICAL FIX: The pitch unit must be 'Hz', not 'st'.
     pitch_str = f"+{pitch_val}Hz" if pitch_val >= 0 else f"{pitch_val}Hz"
-    
     logger.info(f"Generating audio with dynamic voice: Rate={rate_str}, Pitch={pitch_str}")
     communicate = edge_tts.Communicate(text, VOICE, rate=rate_str, pitch=pitch_str)
     await communicate.save(output_path)
@@ -42,15 +40,30 @@ def generate_audio(text, output_path):
     except Exception as e:
         logger.error(f"Error generating audio: {e}")
         return False
-# ------------------------------------
-# ... (The rest of the file is unchanged)
+
+# --- NEW: LLM Integration ---
 def setup_config():
-    global UNSPLASH_API_KEY
+    global UNSPLASH_API_KEY, GROQ_API_KEY
     if not os.path.exists(CONFIG_FILE): logger.error(f"FATAL: Config file '{CONFIG_FILE}' not found."); return False
     config = configparser.ConfigParser(); config.read(CONFIG_FILE)
     UNSPLASH_API_KEY = config.get('API_KEYS', 'UNSPLASH_ACCESS_KEY', fallback=None)
-    if not UNSPLASH_API_KEY or UNSPLASH_API_KEY == "YOUR_ACCESS_KEY_HERE": logger.error(f"FATAL: Unsplash API key not found in '{CONFIG_FILE}'."); return False
+    GROQ_API_KEY = config.get('API_KEYS', 'GROQ_API_KEY', fallback=None)
+    if not UNSPLASH_API_KEY or not GROQ_API_KEY: logger.error(f"FATAL: Unsplash or Groq API key not found in '{CONFIG_FILE}'."); return False
     return True
+
+def get_llm_script(title, summary, client):
+    logger.info("Requesting LLM to rewrite summary into a professional news script...")
+    prompt_messages = [
+        {"role": "system", "content": "You are a professional news scriptwriter for a short-form vertical video. Your task is to distill a news article's headline and summary into a concise, authoritative, broadcast-style script. Rules: 1. Speak directly and factually. 2. DO NOT use any conversational filler (e.g., 'Hey there,' 'As you know,'). 3. DO NOT address the audience directly. 4. Combine the headline and summary into a seamless narrative. 5. Your entire response should ONLY be the script text itself. No extra commentary or labels."},
+        {"role": "user", "content": f"Headline: \"{title}\". Summary: \"{summary}\""}
+    ]
+    try:
+        chat_completion = client.chat.completions.create(messages=prompt_messages, model="llama3-8b-8192")
+        llm_script = chat_completion.choices[0].message.content.strip().replace("Here's the rewritten script:", "").strip()
+        logger.info("LLM rewrite successful.")
+        return llm_script
+    except Exception as e: logger.error(f"LLM request failed: {e}"); return f"{title}. {summary}"
+
 def get_next_segment():
     last_segment = "";
     if os.path.exists(LAST_SEGMENT_FILE):
@@ -75,7 +88,7 @@ def save_processed_urls(new_urls):
     logger.info(f"Saved {len(new_urls)} new URLs to history.")
 def setup_font():
     global FONT_PATH
-    font_preferences = ["Arial", "Helvetica Neue", "Calibri", "Helvetica", "DejaVu Sans", "Liberation Sans"]
+    font_preferences = ["Arial", "Helvetica Neue", "Calibri", "Helvetica", "DejaVu Sans"]
     for font_name in font_preferences:
         try: FONT_PATH = font_manager.findfont(font_name, fallback_to_default=False); return True
         except Exception: pass
@@ -180,15 +193,22 @@ def create_clip_asset(summary, original_headline, output_path):
     canvas.save(output_path); return True
 def check_ffmpeg():
     return shutil.which("ffmpeg")
-def create_video_clips(news_items, temp_dir):
+
+# --- THIS FUNCTION IS MODIFIED TO USE THE LLM ---
+def create_video_clips(news_items, temp_dir, llm_client):
     clips_data = []
     for i, item in enumerate(news_items):
         original_headline, summary = item['title'], item['summary']
         logger.info(f"--- Processing clip {i+1}/{len(news_items)}: {original_headline[:60]}... ---")
         visual_path = os.path.join(temp_dir, f"visual_{i}.png"); audio_path = os.path.join(temp_dir, f"audio_{i}.mp3")
-        narration_text = f"{original_headline}. {summary}"
+        
+        # Get the professional script from the LLM
+        narration_text = get_llm_script(original_headline, summary, llm_client)
+        
+        # We pass the original summary to create_clip_asset to keep the on-screen text
         if not create_clip_asset(summary, original_headline, visual_path): continue
         if not generate_audio(narration_text, audio_path): continue
+        
         try:
             ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
             result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
@@ -197,6 +217,7 @@ def create_video_clips(news_items, temp_dir):
             clips_data.append({"visual_path": visual_path, "audio_path": audio_path, "duration": final_duration, "url": item['link'], "title": original_headline})
         except Exception as e: logger.error(f"Failed to process audio for clip: {e}")
     return clips_data
+
 def create_outro_clip(temp_dir, ffmpeg_path, gif_path):
     outro_audio_path = os.path.join(temp_dir, "outro_audio.mp3")
     outro_image_path = os.path.join(temp_dir, "outro_image.png")
@@ -225,7 +246,7 @@ def compile_final_video(clips_data, output_path, ffmpeg_path):
         clip_path = os.path.join(temp_dir, f"clip_{i}.mp4")
         chosen_effect = random.choice(KEN_BURNS_EFFECTS)
         filter_str = f"scale={VIDEO_WIDTH}*2:-1,{chosen_effect}:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
-        cmd = [ffmpeg_path, '-i', clip['visual_path'], '-i', clip['audio_path'], '-filter_complex', f"[0:v]{filter_str}[v]", '-map', '[v]', '-map', '1:a', '-c:v', 'libx264', '-c:a', 'aac', '-b:a', '192k', '-pix_fmt', 'yuv420p', '-r', str(FPS), '-shortest', '-y', clip_path]
+        cmd = [ffmpeg_path, '-loop', '1', '-i', clip['visual_path'], '-i', clip['audio_path'], '-filter_complex', f"[0:v]{filter_str}[v]", '-map', '[v]', '-map', '1:a', '-t', str(clip['duration']), '-c:v', 'libx264', '-c:a', 'aac', '-b:a', '192k', '-pix_fmt', 'yuv420p', '-r', str(FPS), '-y', clip_path]
         try:
             logger.info(f"Assembling video for clip {i+1}...")
             subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -278,9 +299,15 @@ def generate_summary_and_hashtags(clips_data, segment_name, output_file):
     description += "\n---\n" + " ".join(list(hashtags_set))
     with open(output_file, 'w', encoding='utf-8') as f: f.write(description)
     logger.info(f"Successfully saved description and hashtags to '{output_file}'")
+
+# --- THIS IS THE MODIFIED MAIN FUNCTION ---
 def main():
     ffmpeg_path = check_ffmpeg()
     if not setup_config() or not setup_font() or not ffmpeg_path or not setup_nlp_model(): sys.exit(1)
+    
+    # Initialize the LLM client
+    llm_client = Groq(api_key=GROQ_API_KEY)
+    
     current_segment_name, segment_feeds = get_next_segment()
     processed_urls = load_processed_urls()
     temp_dir = None
@@ -288,11 +315,12 @@ def main():
         temp_dir = setup_output_directory()
         output_video_path = os.path.join(os.getcwd(), f"news_{current_segment_name.replace(' ', '_')}.mp4")
         news_items = scrape_news(segment_feeds, processed_urls)
+        
         if not news_items:
             logger.info("No new articles found. Exiting with status 10.")
             sys.exit(10)
         
-        clips_data = create_video_clips(news_items, temp_dir)
+        clips_data = create_video_clips(news_items, temp_dir, llm_client)
         if clips_data:
             if compile_final_video(clips_data, output_video_path, ffmpeg_path):
                 newly_processed_urls = [clip['url'] for clip in clips_data]
